@@ -236,6 +236,73 @@ impl DisplayAs for DeltaDataSink {
     }
 }
 
+/// Returns the column name used to sort surviving `Add` actions by
+/// `stats.minValues.<column>` before they are handed to DataFusion. The
+/// value is read from `DELTA_SCAN_SORT_BY_MIN_COLUMN`; if the environment
+/// variable is unset, the fallback is `"id"`.
+fn sort_column_from_env() -> String {
+    std::env::var("DELTA_SCAN_SORT_BY_MIN_COLUMN").unwrap_or_else(|_| "id".to_string())
+}
+
+/// Extracts `stats.minValues.<column>` (parsed as `i64`) from the JSON-encoded
+/// statistics string on an `Add` action, returning `None` when stats are
+/// absent, malformed, missing the `minValues.<column>` key, or hold a
+/// non-integer value.
+fn min_value_from_stats(stats: Option<&str>, column: &str) -> Option<i64> {
+    let v: serde_json::Value = serde_json::from_str(stats?).ok()?;
+    v.get("minValues")?.get(column)?.as_i64()
+}
+
+/// Stably sorts a slice of items by their per-file `stats.minValues.<column>`,
+/// placing items whose stats lack an integer minimum for that column at the
+/// end while preserving their natural relative order (the order surfaced by
+/// log-replay). `path_of` and `stats_of` extract the file path and the
+/// JSON-encoded stats string, respectively.
+///
+/// Before sorting, this also emits one `tracing::info!` line per file with
+/// the parsed `minValues` object and the resolved sort key, to make it easy
+/// to verify which keys are actually present (e.g., for tables with column
+/// mapping where physical UUID names appear instead of logical column names).
+fn sort_by_min_value_in_stats<T, F, G>(
+    items: &mut [T],
+    column: &str,
+    mut path_of: F,
+    mut stats_of: G,
+) where
+    F: FnMut(&T) -> &str,
+    G: FnMut(&T) -> Option<&str>,
+{
+    use std::cmp::Ordering;
+
+    for item in items.iter() {
+        let path = path_of(item);
+        let stats = stats_of(item);
+        let min_values = stats
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .as_ref()
+            .and_then(|v| v.get("minValues").cloned());
+        let sort_key = min_value_from_stats(stats, column);
+        let min_values_repr = min_values
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "<absent>".to_string());
+        tracing::info!(
+            "delta scan sort: file={path} column={column} minValues={min_values_repr} sort_key={sort_key:?}"
+        );
+    }
+
+    items.sort_by(|a, b| {
+        match (
+            min_value_from_stats(stats_of(a), column),
+            min_value_from_stats(stats_of(b), column),
+        ) {
+            (Some(av), Some(bv)) => av.cmp(&bv),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        }
+    });
+}
+
 #[derive(Debug, Clone)]
 /// Used to specify if additional metadata columns are exposed to the user
 pub struct DeltaScanConfigBuilder {
@@ -556,12 +623,30 @@ impl<'a> DeltaScanBuilder<'a> {
             None => {
                 // early return in case we have no push down filters or limit
                 if logical_filter.is_none() && self.limit.is_none() {
-                    let files = self
+                    let mut files = self
                         .snapshot
                         .file_views(&self.log_store, None)
                         .map_ok(|f| f.add_action())
                         .try_collect::<Vec<_>>()
                         .await?;
+                    // Sort surviving Add actions by the per-file
+                    // `stats.minValues.<column>` value recorded in the
+                    // transaction log, so the parquet scan visits files in
+                    // increasing order of that column (e.g. the file
+                    // containing ids [1..1e7] before the file containing ids
+                    // [1e7+1..2e7]). The column defaults to "id" and can be
+                    // overridden via the `DELTA_SCAN_SORT_BY_MIN_COLUMN`
+                    // environment variable. Files whose stats are missing or
+                    // do not include a minimum for that column are placed at
+                    // the end and keep their natural log-replay order among
+                    // themselves (sort_by is stable).
+                    let sort_column = sort_column_from_env();
+                    sort_by_min_value_in_stats(
+                        &mut files,
+                        &sort_column,
+                        |add| add.path.as_str(),
+                        |add| add.stats.as_deref(),
+                    );
                     let files_scanned = files.len();
                     (files, files_scanned, 0, None)
                 } else {
@@ -588,9 +673,31 @@ impl<'a> DeltaScanBuilder<'a> {
                         .try_collect::<Vec<_>>()
                         .await?;
 
-                    for (action, keep) in
-                        file_actions.into_iter().zip(files_to_prune.iter().cloned())
-                    {
+                    // Pair each action with its pruning decision and sort the
+                    // pairs by the per-file `stats.minValues.<column>` so the
+                    // parquet scan visits files in increasing order of that
+                    // column. The column defaults to "id" and can be
+                    // overridden via the `DELTA_SCAN_SORT_BY_MIN_COLUMN`
+                    // environment variable. Files without stats or without a
+                    // minimum for that column are placed at the end with
+                    // their natural log-replay relative order preserved
+                    // (sort_by is stable). Sorting the pairs together
+                    // preserves the alignment that would otherwise be broken
+                    // by sorting `file_actions` against the position-indexed
+                    // `files_to_prune` mask.
+                    let mut paired: Vec<_> = file_actions
+                        .into_iter()
+                        .zip(files_to_prune.iter().cloned())
+                        .collect();
+                    let sort_column = sort_column_from_env();
+                    sort_by_min_value_in_stats(
+                        &mut paired,
+                        &sort_column,
+                        |(add, _)| add.path.as_str(),
+                        |(add, _)| add.stats.as_deref(),
+                    );
+
+                    for (action, keep) in paired.into_iter() {
                         // prune file based on predicate pushdown
                         if keep {
                             // prune file based on limit pushdown
