@@ -4,7 +4,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use arrow::array::BooleanArray;
-use arrow::compute::filter_record_batch;
+use arrow::compute::{filter_record_batch, SortOptions};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use chrono::{DateTime, TimeZone, Utc};
@@ -28,6 +28,8 @@ use datafusion::logical_expr::simplify::SimplifyContext;
 use datafusion::logical_expr::utils::split_conjunction;
 use datafusion::logical_expr::{BinaryExpr, LogicalPlan, Operator};
 use datafusion::optimizer::simplify_expressions::ExprSimplifier;
+use datafusion::physical_expr::expressions::Column as PhysicalColumn;
+use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_optimizer::pruning::PruningPredicate;
 use datafusion::physical_plan::filter_pushdown::{FilterDescription, FilterPushdownPhase};
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
@@ -613,6 +615,11 @@ impl<'a> DeltaScanBuilder<'a> {
             })
             .map(|expr| simplify_expr(self.session, &df_schema, expr));
 
+        // Column whose per-file `stats.minValues.<column>` drives the sort
+        // below and the output ordering declared on the FileScanConfig further
+        // down. Defaults to "id"; overridable via DELTA_SCAN_SORT_BY_MIN_COLUMN.
+        let sort_column = sort_column_from_env();
+
         // Perform Pruning of files to scan
         let (files, files_scanned, files_pruned, pruning_mask) = match self.files {
             Some(files) => {
@@ -640,7 +647,6 @@ impl<'a> DeltaScanBuilder<'a> {
                     // do not include a minimum for that column are placed at
                     // the end and keep their natural log-replay order among
                     // themselves (sort_by is stable).
-                    let sort_column = sort_column_from_env();
                     sort_by_min_value_in_stats(
                         &mut files,
                         &sort_column,
@@ -689,7 +695,6 @@ impl<'a> DeltaScanBuilder<'a> {
                         .into_iter()
                         .zip(files_to_prune.iter().cloned())
                         .collect();
-                    let sort_column = sort_column_from_env();
                     sort_by_min_value_in_stats(
                         &mut paired,
                         &sort_column,
@@ -766,6 +771,31 @@ impl<'a> DeltaScanBuilder<'a> {
                 .cloned()
                 .collect::<Vec<arrow::datatypes::FieldRef>>(),
         ));
+
+        // Declare the scan's output ordering when the sort column exists in
+        // the file schema. Files were already sorted by their per-file min of
+        // this column above, and tables produced by partitioned writers have
+        // non-overlapping ranges and (assumed) row order within each file, so
+        // each scan partition's stream is monotonic in this column. With the
+        // ordering declared, DataFusion can satisfy a downstream `ORDER BY
+        // <column>` requirement by inserting `SortPreservingMergeExec`
+        // instead of a full sort -- letting parallel scans pull from S3
+        // concurrently while the merge restores global order before the
+        // result reaches the consumer.
+        let output_ordering: Vec<LexOrdering> = file_schema
+            .index_of(&sort_column)
+            .ok()
+            .and_then(|idx| {
+                LexOrdering::new(std::iter::once(PhysicalSortExpr {
+                    expr: Arc::new(PhysicalColumn::new(&sort_column, idx)),
+                    options: SortOptions {
+                        descending: false,
+                        nulls_first: false,
+                    },
+                }))
+            })
+            .map(|lex| vec![lex])
+            .unwrap_or_default();
 
         let mut table_partition_cols = table_partition_cols
             .iter()
@@ -846,6 +876,7 @@ impl<'a> DeltaScanBuilder<'a> {
                 .with_projection_indices(self.projection.cloned())
                 .with_limit(self.limit)
                 .with_table_partition_cols(table_partition_cols)
+                .with_output_ordering(output_ordering)
                 .build();
 
         let metrics = ExecutionPlanMetricsSet::new();
