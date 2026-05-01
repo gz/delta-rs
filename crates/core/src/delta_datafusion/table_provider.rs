@@ -860,6 +860,48 @@ impl<'a> DeltaScanBuilder<'a> {
         let file_source =
             file_source.with_schema_adapter_factory(Arc::new(DeltaSchemaAdapterFactory {}))?;
 
+        // For unpartitioned tables we end up with a single bucket containing
+        // every file. Hand DataFusion that single FileGroup directly and
+        // it will either (a) leave it as one execution partition and insert
+        // a `RepartitionExec(RoundRobinBatch)` to satisfy `target_partitions`
+        // -- which scrambles batches and breaks our declared output_ordering
+        // -- or (b) byte-split via `repartition_file_scans`, which it
+        // refuses when ordering is declared. Pre-split into exactly
+        // `target_partitions` groups ourselves, distributing files
+        // round-robin (file i to group i % K).
+        //
+        // Why round-robin over contiguous slices: each group's files still
+        // come out id-sorted (because the input list is id-sorted and
+        // round-robin preserves order within strides), so each partition's
+        // stream remains monotonic in the sort column. But with round-robin,
+        // **adjacent files in the global id order land in different
+        // groups**: file N is in group (N % K) and file N+1 is in group
+        // ((N+1) % K). The merge transitions between groups on every file
+        // boundary instead of every K files. That keeps the prefetched
+        // row-group in each "next" group near-future data the merge will
+        // need imminently, rather than data ~K files away.
+        //
+        // The split must produce *exactly* `target_partitions` groups
+        // (capped at `files.len()`), otherwise DataFusion sees
+        // `input_partitions != target_partitions` and inserts a
+        // `RepartitionExec(RoundRobinBatch)` on top, which scrambles
+        // batches across partitions and breaks both the declared
+        // ordering and the `SortPreservingMergeExec` upstream.
+        let target_partitions = self.session.config().options().execution.target_partitions;
+        let file_groups: Vec<Vec<PartitionedFile>> =
+            if file_groups.len() == 1 && target_partitions > 1 {
+                let (_, files) = file_groups.into_iter().next().unwrap();
+                let group_count = target_partitions.min(files.len()).max(1);
+                let mut groups: Vec<Vec<PartitionedFile>> =
+                    (0..group_count).map(|_| Vec::new()).collect();
+                for (i, file) in files.into_iter().enumerate() {
+                    groups[i % group_count].push(file);
+                }
+                groups
+            } else {
+                file_groups.into_values().collect()
+            };
+
         let file_scan_config =
             FileScanConfigBuilder::new(self.log_store.object_store_url(), file_schema, file_source)
                 .with_file_groups(
@@ -870,7 +912,7 @@ impl<'a> DeltaScanBuilder<'a> {
                     if file_groups.is_empty() {
                         vec![FileGroup::from(vec![])]
                     } else {
-                        file_groups.into_values().map(FileGroup::from).collect()
+                        file_groups.into_iter().map(FileGroup::from).collect()
                     },
                 )
                 .with_statistics(stats)
