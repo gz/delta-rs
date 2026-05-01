@@ -12,7 +12,8 @@ use datafusion::catalog::TableProvider;
 use datafusion::catalog::memory::DataSourceExec;
 use datafusion::common::pruning::PruningStatistics;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion::common::{Column, DFSchema, Result, Statistics, ToDFSchema};
+use datafusion::common::stats::Precision;
+use datafusion::common::{Column, ColumnStatistics, DFSchema, Result, Statistics, ToDFSchema};
 use datafusion::config::{ConfigOptions, TableParquetOptions};
 use datafusion::datasource::TableType;
 use datafusion::datasource::physical_plan::{
@@ -1504,9 +1505,76 @@ fn partitioned_file_from_action(
         partition_values,
         range: None,
         extensions: None,
-        statistics: None,
+        // Populating per-file Statistics from the JSON `Add.stats` is what
+        // unlocks DataFusion's `MinMaxStatistics::new_from_files` check
+        // (datafusion-datasource: get_projected_output_ordering). With these
+        // populated, the optimizer can verify each multi-file group is
+        // actually sorted on the column we declared in `output_ordering`,
+        // accept the ordering claim, and satisfy a downstream `ORDER BY` via
+        // a streaming `SortPreservingMergeExec` instead of a per-partition
+        // `SortExec` that buffers (and OOMs on) the full scan output.
+        statistics: build_partitioned_file_statistics(action, partition_columns, schema),
         metadata_size_hint: None,
     }
+}
+
+/// Translates the JSON-encoded statistics on an `Add` action into a
+/// per-file `Statistics` aligned with the file schema (table schema minus
+/// partition columns), so DataFusion can prove file groups are sorted on
+/// declared output orderings and prune by min/max where applicable.
+///
+/// Returns `None` when the `Add` carries no stats. For columns that are
+/// present in the schema but lack a parseable scalar in the stats, the
+/// corresponding `ColumnStatistics` fields fall back to `Precision::Absent`.
+fn build_partitioned_file_statistics(
+    action: &Add,
+    partition_columns: &[String],
+    schema: &Schema,
+) -> Option<Arc<Statistics>> {
+    let parsed = action.get_stats().ok().flatten()?;
+
+    let column_statistics: Vec<ColumnStatistics> = schema
+        .fields()
+        .iter()
+        .filter(|f| !partition_columns.contains(f.name()))
+        .map(|f| {
+            let name = f.name();
+            let dt = f.data_type();
+            let min_value = parsed
+                .min_values
+                .get(name)
+                .and_then(|v| v.as_value())
+                .and_then(|v| to_correct_scalar_value(v, dt).ok().flatten())
+                .map(Precision::Exact)
+                .unwrap_or(Precision::Absent);
+            let max_value = parsed
+                .max_values
+                .get(name)
+                .and_then(|v| v.as_value())
+                .and_then(|v| to_correct_scalar_value(v, dt).ok().flatten())
+                .map(Precision::Exact)
+                .unwrap_or(Precision::Absent);
+            let null_count = parsed
+                .null_count
+                .get(name)
+                .and_then(|c| c.as_value())
+                .map(|c| Precision::Exact(c as usize))
+                .unwrap_or(Precision::Absent);
+            ColumnStatistics {
+                null_count,
+                max_value,
+                min_value,
+                sum_value: Precision::Absent,
+                distinct_count: Precision::Absent,
+            }
+        })
+        .collect();
+
+    Some(Arc::new(Statistics {
+        num_rows: Precision::Exact(parsed.num_records as usize),
+        total_byte_size: Precision::Exact(action.size as usize),
+        column_statistics,
+    }))
 }
 
 #[cfg(test)]
